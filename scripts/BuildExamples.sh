@@ -9,6 +9,9 @@
 #
 # Exit code is non-zero if any non-skipped example fails to compile.
 #
+# Examples compile in parallel, one fpc per CPU, each with its own unit and
+# output directories. JOBS overrides the count; JOBS=1 is the old serial run.
+#
 # Usage:
 #   bash scripts/BuildExamples.sh
 #   LAZUTILS_PATH=/path/to/lazutils/lib/<arch> bash scripts/BuildExamples.sh
@@ -33,7 +36,6 @@ fi
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
-mkdir -p "$WORK_DIR/units"   # fpc -FU does not create its output dir
 
 # A program needs the LCL widgetset (cannot compile headless with plain fpc)
 # when its uses-clause references a GUI unit.
@@ -58,7 +60,38 @@ echo "==> Found ${#LPRS[@]} example programs under examples/"
 [ -d "$LAZUTILS_PATH" ] && echo "==> Using LazUtils: $LAZUTILS_PATH" || echo "==> LazUtils not found (optional) — building without it"
 echo
 
-for lpr in "${LPRS[@]}"; do
+JOBS="${JOBS:-$(nproc)}"
+
+# Compile one example; the loop below reads the result from $dir.
+build_one() {
+  local lpr="$1" dir="$2"
+  mkdir -p "$dir/units"   # fpc -FU does not create its output dir
+  if fpc -B -Mobjfpc -Sh -O2 -Fu"$NEURAL_DIR" "${LAZ_FLAG[@]}" \
+        -FU"$dir/units" -o"$dir/$(basename "${lpr%.lpr}")" "$lpr" >"$dir/build.log" 2>&1; then
+    touch "$dir/ok"
+  fi
+  rm -rf "$dir/units"
+}
+
+running=0
+for i in "${!LPRS[@]}"; do
+  lpr="${LPRS[$i]}"
+  rel="${lpr#"$ROOT_DIR"/}"
+  if needs_gui "$lpr" || [ -n "${SPECIAL_SKIP[$rel]:-}" ]; then
+    continue
+  fi
+  build_one "$lpr" "$WORK_DIR/$i" &
+  running=$((running + 1))
+  if [ "$running" -ge "$JOBS" ]; then
+    wait -n
+    running=$((running - 1))
+  fi
+done
+wait
+
+# Report in the same sorted order as a serial run.
+for i in "${!LPRS[@]}"; do
+  lpr="${LPRS[$i]}"
   rel="${lpr#"$ROOT_DIR"/}"
   if needs_gui "$lpr"; then
     SKIP_LIST+=("$rel")
@@ -70,16 +103,13 @@ for lpr in "${LPRS[@]}"; do
     printf 'SKIP (env) %s  — %s\n' "$rel" "${SPECIAL_SKIP[$rel]}"
     continue
   fi
-  out="$WORK_DIR/$(basename "${lpr%.lpr}")"
-  log="$WORK_DIR/build.log"
-  if fpc -B -Mobjfpc -Sh -O2 -Fu"$NEURAL_DIR" "${LAZ_FLAG[@]}" \
-        -FU"$WORK_DIR/units" -o"$out" "$lpr" >"$log" 2>&1; then
+  if [ -e "$WORK_DIR/$i/ok" ]; then
     OK_LIST+=("$rel")
     printf 'OK         %s\n' "$rel"
   else
     FAIL_LIST+=("$rel")
     printf 'FAIL       %s\n' "$rel"
-    sed 's/^/    | /' "$log" | grep -iE 'error|fatal' | head -5
+    sed 's/^/    | /' "$WORK_DIR/$i/build.log" | grep -iE 'error|fatal' | head -5
   fi
 done
 
